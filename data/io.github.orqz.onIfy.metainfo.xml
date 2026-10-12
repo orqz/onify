@@ -41,6 +41,11 @@
     <control>pointing</control>
   </recommends>
   <releases>
+    <release version="0.1.4.1" date="2026-10-12">
+      <description>
+        <p>Much lighter drawing (the background, zoom and scaled screens), Previous and Next work right after opening onify (taskbar buttons, tray and media keys too), playback carries on after the connection drops, and fixed playlist creating, renaming and deleting.</p>
+      </description>
+    </release>
     <release version="0.1.4.0" date="2026-10-10">
       <description>
         <p>Playlist editing (add, remove, reorder, create, rename, delete), find inside playlists, crossfade, the last song ready to play at startup, Spotify Connect device switching, zoom, a collapsible sidebar, like and menu buttons on songs, latest and popular releases on artist pages, arrows on Home, Previous twice goes back a song, smoother scrolling and page changes, the system's own font, and ARM builds.</p>
