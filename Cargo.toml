@@ -1,6 +1,6 @@
 [package]
 name = "onify"
-version = "0.1.4+0"
+version = "0.1.4+1"
 edition = "2024"
 description = "A smooth, lightweight native Spotify client"
 license = "MIT"
@@ -13,6 +13,9 @@ librespot-core = "0.8"
 librespot-connect = "0.8"
 librespot-oauth = "0.8"
 librespot-metadata = "0.8"
+# Playlist changes are sent as the playlist service's own protobuf messages.
+librespot-protocol = "0.8"
+protobuf = "3"
 librespot-playback = { version = "0.8", default-features = false, features = ["native-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 http = "1"

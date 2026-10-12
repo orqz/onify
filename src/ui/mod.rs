@@ -120,6 +120,9 @@ pub struct Ctx {
     last_played: RefCell<Option<crate::resume::LastPlayed>>,
     /// Play was pressed on it before Spotify had connected.
     resume_pending: Cell<bool>,
+    /// Next or Previous pressed with nothing loaded: done once the song from
+    /// last time (or another device's) plays, if that's within 15 s.
+    skip_after_resume: Cell<Option<(Skip, std::time::Instant)>>,
     /// Saves the position every few seconds while music plays.
     remember_tick: RefCell<Option<glib::SourceId>>,
     /// A link to open once the library has loaded.
@@ -173,6 +176,7 @@ pub fn left_page(uri: &str) {
 }
 
 pub fn toast(message: &str) {
+    log::info!("toast: {message}");
     let toast = adw::Toast::new(message);
     toast.set_use_markup(false);
     toast.set_timeout(3);
@@ -384,6 +388,7 @@ pub fn activate(app: &adw::Application) {
         now: RefCell::default(),
         last_played: RefCell::default(),
         resume_pending: Cell::new(false),
+        skip_after_resume: Cell::new(None),
         remember_tick: RefCell::default(),
         pending_link: RefCell::default(),
         shown_library: RefCell::default(),
@@ -1053,6 +1058,65 @@ pub fn resume_or_take_over() {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Skip {
+    Next,
+    Previous,
+}
+
+/// Next or Previous. With nothing loaded (just after starting, last time's
+/// song only shown), librespot ignores both, so last time's song is loaded
+/// first, in its playlist, and the skip happens once it plays.
+fn skip(direction: Skip) {
+    if devices::is_remote() {
+        let endpoint = if direction == Skip::Next { "skip_next" } else { "skip_prev" };
+        devices::command(endpoint, serde_json::json!({}));
+        return;
+    }
+    let ctx = ctx();
+    if !ctx.bar.has_track() {
+        ctx.skip_after_resume.set(Some((direction, std::time::Instant::now())));
+        // From the song's start, so Previous goes back a song.
+        ctx.bar.set_position(0);
+        resume_or_take_over();
+        return;
+    }
+    ctx.with_engine(|e| match direction {
+        Skip::Next => e.next(),
+        Skip::Previous => e.prev(),
+    });
+}
+
+/// A skip waiting for playback to start (see `skip`).
+fn skip_after_resume() {
+    let ctx = ctx();
+    let Some((direction, asked)) = ctx.skip_after_resume.take() else { return };
+    if asked.elapsed() > Duration::from_secs(15) {
+        return;
+    }
+    ctx.with_engine(|e| match direction {
+        Skip::Next => e.next(),
+        Skip::Previous => e.prev(),
+    });
+}
+
+/// A new session starts with nothing loaded, and librespot ignores play,
+/// next and previous until something is. So the song showing becomes one to
+/// pick up, like last time's song at startup, and if it was playing it
+/// carries on once connected.
+fn hold_for_new_session(playing: bool) {
+    let ctx = ctx();
+    if devices::is_remote() || !ctx.bar.has_track() {
+        return;
+    }
+    remember(ctx.bar.position_ms());
+    let Some((now, position_ms)) = ctx.last_played.borrow().as_ref().map(|l| (l.now.clone(), l.position_ms)) else { return };
+    ctx.bar.set_resumable(&now, position_ms);
+    ctx.window.set_title(Some("onify"));
+    integrations::paused(position_ms);
+    ctx.resume_pending.set(playing);
+}
+
 /// Saves the playing song and how far in it is, for next time.
 fn remember(position_ms: u32) {
     let ctx = ctx();
@@ -1194,6 +1258,7 @@ fn restart_if_stale() {
     if let Some(engine) = ctx.engine.take() {
         engine.shutdown();
     }
+    hold_for_new_session(false);
     // Give the old device a moment to sign off before this one takes its id.
     glib::timeout_add_local_once(Duration::from_millis(300), move || connect(credentials));
 }
@@ -1319,6 +1384,7 @@ fn handle_event(event: Event) {
             integrations::playing(position_ms);
             lyrics::resync();
             remember_while_playing(true);
+            skip_after_resume();
         }
         Event::Paused { position_ms } => {
             remember_while_playing(false);
@@ -1397,7 +1463,9 @@ fn handle_event(event: Event) {
         }
         Event::Disconnected(generation) => {
             if generation == ctx.generation.get() {
+                let playing = ctx.bar.is_playing();
                 ctx.engine.take();
+                hold_for_new_session(playing);
                 reconnect();
             }
         }
@@ -1431,20 +1499,12 @@ pub fn seek_to(ms: i64) {
 
 /// Next song, here or on the device that's playing.
 pub fn next() {
-    if devices::is_remote() {
-        devices::command("skip_next", serde_json::json!({}));
-    } else {
-        ctx().with_engine(|e| e.next());
-    }
+    skip(Skip::Next);
 }
 
 /// Previous song (or the start of this one), here or on the device playing.
 pub fn prev() {
-    if devices::is_remote() {
-        devices::command("skip_prev", serde_json::json!({}));
-    } else {
-        ctx().with_engine(|e| e.prev());
-    }
+    skip(Skip::Previous);
 }
 
 fn install_actions(app: &adw::Application) {
@@ -1530,6 +1590,19 @@ fn install_actions(app: &adw::Application) {
             navigate(route, true);
         });
         with_string("dev-update", |_| updater::update_now());
+        // Drops the session as a network loss would, or restarts it as a
+        // settings change does.
+        with_string("dev-disconnect", |_| {
+            let ctx = ctx();
+            if let Some(engine) = ctx.engine.borrow().as_ref() {
+                engine.shutdown();
+            }
+            handle_event(Event::Disconnected(ctx.generation.get()));
+        });
+        with_string("dev-restart", |_| {
+            ctx().engine_stale.set(true);
+            restart_if_stale();
+        });
         // Scrolls the visible page top to bottom in 4 s and logs frame times.
         with_string("dev-scroll", |_| dev_scroll());
         with_string("dev-volume", |_| ctx().bar.show_volume_pop());
@@ -1552,6 +1625,87 @@ fn install_actions(app: &adw::Application) {
             }
         });
         with_string("dev-shuffle", |_| ctx().bar.toggle_shuffle());
+        // Times each frame's phases (tick callbacks, layout, drawing) for 5 s.
+        with_string("dev-frames", |_| dev_frames());
+        // Renders the window's current frame 30 times off-screen and logs
+        // the average: GTK's renderer alone, without building the frame.
+        with_string("dev-rendercost", |_| {
+            let window = ctx().window.clone();
+            let paintable = gtk::WidgetPaintable::new(Some(&window));
+            window.queue_draw();
+            glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                let (w, h) = (window.width() as f64, window.height() as f64);
+                let snapshot = gtk::Snapshot::new();
+                paintable.current_image().snapshot(&snapshot, w, h);
+                let (Some(node), Some(renderer)) = (snapshot.to_node(), window.renderer()) else { return };
+                let started = std::time::Instant::now();
+                for _ in 0..30 {
+                    let _ = renderer.render_texture(&node, None);
+                }
+                log::warn!("dev-rendercost: {:.2} ms per render", started.elapsed().as_secs_f64() * 1000.0 / 30.0);
+            });
+        });
+        // The window's render node, as text, for finding costly nodes.
+        with_string("dev-node", |path| {
+            let window = ctx().window.clone();
+            let paintable = gtk::WidgetPaintable::new(Some(&window));
+            let path = path.to_owned();
+            window.queue_draw();
+            glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                let snapshot = gtk::Snapshot::new();
+                paintable.current_image().snapshot(&snapshot, window.width() as f64, window.height() as f64);
+                if let Some(node) = snapshot.to_node() {
+                    let _ = std::fs::write(&path, node.serialize());
+                }
+            });
+        });
+        // Adds two songs to a playlist, moves the last to the top, removes
+        // the second, logging the playlist after each step.
+        with_string("dev-playlist-check", |playlist| {
+            let Some(api) = ctx().api() else { return };
+            let playlist = playlist.to_owned();
+            spawn_local(async move {
+                let report = rt::spawn(async move {
+                    let mut log = Vec::new();
+                    let added = api
+                        .add_to_playlist(&playlist, &["spotify:track:7qiZfU4dY1lWllzX7mPBI3".into(), "spotify:track:0VjIjW4GlUZAMYd2vXMi3b".into()])
+                        .await;
+                    log.push(format!("add: {added:?}"));
+                    let songs = api.describe_playlist(&playlist).await;
+                    log.push(format!("after add: {songs:?}"));
+                    if let (Some(last), Some(first)) = (songs.last(), songs.first()) {
+                        let moved = api.move_in_playlist(&playlist, &[last.1.clone()], Some(&first.1)).await;
+                        log.push(format!("move: {moved:?}"));
+                    }
+                    let songs = api.describe_playlist(&playlist).await;
+                    log.push(format!("after move: {songs:?}"));
+                    if let Some(second) = songs.get(1) {
+                        let removed = api.remove_from_playlist(&playlist, &[second.1.clone()]).await;
+                        log.push(format!("remove: {removed:?}"));
+                    }
+                    log.push(format!("after remove: {:?}", api.describe_playlist(&playlist).await));
+                    log.join("\n")
+                })
+                .await;
+                log::warn!("dev-playlist-check:\n{report}");
+            });
+        });
+        with_string("dev-delete-playlist", |playlist| {
+            let Some(api) = ctx().api() else { return };
+            let playlist = playlist.to_owned();
+            spawn_local(async move {
+                let asked = playlist.clone();
+                let done = rt::spawn(async move { api.delete_playlist(&asked).await }).await;
+                log::warn!("dev-delete-playlist {playlist}: {done:?}");
+            });
+        });
+        with_string("dev-rootlist", |_| {
+            let Some(api) = ctx().api() else { return };
+            spawn_local(async move {
+                let found = rt::spawn(async move { api.describe_rootlist().await }).await;
+                log::warn!("dev-rootlist: {found:?}");
+            });
+        });
         // Plays a playlist or album from the top, as its Play button does.
         with_string("dev-play-context", |uri| ctx().with_engine(|e| e.play_context(uri, None, None)));
         // Finds in the open list, as typing after Ctrl+F would.
@@ -1663,6 +1817,110 @@ fn install_keys(window: &adw::ApplicationWindow) {
         glib::Propagation::Stop
     });
     window.add_controller(wheel);
+}
+
+/// Developer aid: where each frame's time goes, averaged over 5 s:
+/// "update" (tick callbacks and animations), "layout" and "paint"
+/// (snapshot and rendering).
+fn dev_frames() {
+    let Some(clock) = ctx().window.frame_clock() else { return };
+    #[derive(Default)]
+    struct Acc {
+        mark: i64,
+        frames: u32,
+        update: i64,
+        layout: i64,
+        paint: i64,
+        /// When this frame's work began, and the longest frame's work.
+        start: i64,
+        worst: i64,
+        slow: u32,
+        handlers: Vec<glib::SignalHandlerId>,
+    }
+    let acc: Rc<RefCell<Acc>> = Rc::default();
+    let now = || glib::monotonic_time();
+    let a = acc.clone();
+    let h1 = clock.connect_update(move |_| {
+        let mut a = a.borrow_mut();
+        a.mark = now();
+        a.start = a.mark;
+    });
+    let a = acc.clone();
+    let h2 = clock.connect_layout(move |_| {
+        let mut a = a.borrow_mut();
+        let t = now();
+        if a.mark > 0 {
+            a.update += t - a.mark;
+        }
+        a.mark = t;
+    });
+    // The surface's own layout and render signals: connected after GTK's,
+    // these fire once GTK has allocated / drawn.
+    let surface = ctx().window.surface();
+    let a = acc.clone();
+    let s1 = surface.as_ref().map(|s| {
+        s.connect_layout(move |_, _, _| {
+            let mut a = a.borrow_mut();
+            let t = now();
+            if a.mark > 0 {
+                a.layout += t - a.mark;
+            }
+            a.mark = t;
+        })
+    });
+    let a = acc.clone();
+    let s2 = surface.as_ref().map(|s| {
+        s.connect_render(move |_, _| {
+            let mut a = a.borrow_mut();
+            let t = now();
+            if a.mark > 0 {
+                a.paint += t - a.mark;
+            }
+            a.mark = t;
+            false
+        })
+    });
+    let a = acc.clone();
+    let h3 = clock.connect_paint(move |_| {
+        let mut a = a.borrow_mut();
+        if a.mark == 0 {
+            a.mark = now();
+        }
+    });
+    let a = acc.clone();
+    let h4 = clock.connect_after_paint(move |_| {
+        let mut a = a.borrow_mut();
+        a.frames += 1;
+        a.mark = 0;
+        if a.start > 0 {
+            let took = now() - a.start;
+            a.worst = a.worst.max(took);
+            a.slow += u32::from(took > 16_000);
+            a.start = 0;
+        }
+    });
+    acc.borrow_mut().handlers = vec![h1, h2, h3, h4];
+    glib::timeout_add_local_once(Duration::from_secs(5), move || {
+        let mut a = acc.borrow_mut();
+        for h in a.handlers.drain(..) {
+            clock.disconnect(h);
+        }
+        if let Some(surface) = surface {
+            for h in [s1, s2].into_iter().flatten() {
+                surface.disconnect(h);
+            }
+        }
+        let n = a.frames.max(1) as f64;
+        log::warn!(
+            "dev-frames: {} frames in 5 s, per frame: update {:.2} ms, layout {:.2} ms, render {:.2} ms; worst {:.1} ms, {} over 16 ms",
+            a.frames,
+            a.update as f64 / n / 1000.0,
+            a.layout as f64 / n / 1000.0,
+            a.paint as f64 / n / 1000.0,
+            a.worst as f64 / 1000.0,
+            a.slow,
+        );
+    });
 }
 
 /// Developer aid: how smoothly the visible page scrolls, as frame times.

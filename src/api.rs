@@ -15,6 +15,8 @@ use http::{Method, Request};
 use librespot_core::session::Session;
 use librespot_core::spotify_uri::SpotifyUri;
 use librespot_metadata::{Metadata, Track as TrackMetadata};
+use librespot_protocol::playlist4_external as pl4;
+use protobuf::{Message, MessageField};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore, mpsc::UnboundedSender};
 
@@ -877,91 +879,130 @@ impl Api {
             .map(drop)
     }
 
-    /// Sends playlist4 changes (the JSON Spotify's apps send) to `endpoint`.
-    async fn playlist_changes(&self, endpoint: &str, body: Value) -> Result<Value> {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+    /// Sends a playlist4 message (`Delta`, `ListChanges`) to the playlist
+    /// service, as Spotify's desktop app does, and returns its answer.
+    async fn playlist_service(&self, endpoint: &str, message: &impl Message) -> Result<Bytes> {
+        use http_body_util::BodyExt;
+        let session = self.session()?;
+        let body = message.write_to_bytes().map_err(|e| e.to_string())?;
+        let base = session.spclient().base_url().await.map_err(|e| e.to_string())?;
+        let token = session.login5().auth_token().await.map_err(|e| e.to_string())?;
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{base}{endpoint}"))
+            .header("Authorization", format!("Bearer {}", token.access_token))
+            .header("Content-Type", "application/x-protobuf")
+            .header("Accept", "application/x-protobuf");
+        if let Ok(client_token) = session.spclient().client_token().await {
+            request = request.header("client-token", client_token);
+        }
+        let request = request.body(Bytes::from(body)).map_err(|e| e.to_string())?;
+        let response = session.http_client().request_fut(request).map_err(|e| e.to_string())?;
+        let response = tokio::time::timeout(Duration::from_secs(20), response)
+            .await
+            .map_err(|_| "Spotify took too long to answer".to_owned())?
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        let bytes = response.into_body().collect().await.map_err(|e| e.to_string())?.to_bytes();
+        if status.is_success() {
+            return Ok(bytes);
+        }
+        log::warn!("playlist service {endpoint}: {status} {}", String::from_utf8_lossy(&bytes));
+        Err(format!("Spotify said {status}"))
+    }
+
+    /// Developer aid: a playlist's songs as "name (uid)", in order.
+    pub async fn describe_playlist(&self, playlist: &str) -> Vec<(String, String)> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        self.clone().stream_tracks(Kind::Playlist, id_of(playlist).to_owned(), tx).await;
+        let mut songs = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            if let Chunk::Tracks(tracks) = chunk {
+                songs.extend(tracks.into_iter().map(|t| (t.name, t.uid)));
+            }
+        }
+        songs
+    }
+
+    /// Developer aid: the start of the user's rootlist, as the service has it.
+    pub async fn describe_rootlist(&self) -> Result<String> {
+        let user = self.session()?.username();
+        let user = url::form_urlencoded::byte_serialize(user.as_bytes()).collect::<String>();
         let bytes = self
             .session()?
             .spclient()
-            .request_as_json(&Method::POST, endpoint, Some(headers), Some(&body.to_string()))
+            .request_as_json(&Method::GET, &format!("/playlist/v2/user/{user}/rootlist?decorate=revision,length,attributes&from=0&length=6"), None, None)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_json::from_slice(&bytes).unwrap_or(Value::Null))
-    }
-
-    /// One change, as Spotify's web player sends it.
-    fn changes(op: Value) -> Value {
-        json!({
-            "deltas": [{ "ops": [op], "info": { "source": { "client": "WEBPLAYER" } } }],
-            "wantResultingRevisions": false,
-            "wantSyncResult": false,
-            "nonces": [],
-        })
+        Ok(String::from_utf8_lossy(&bytes).chars().take(3000).collect())
     }
 
     /// Changes to the user's list of playlists (their library's playlists).
-    async fn rootlist_changes(&self, op: Value) -> Result<()> {
+    async fn rootlist_changes(&self, op: pl4::Op) -> Result<()> {
         let user = self.session()?.username();
-        let endpoint = format!("/playlist/v2/user/{}/rootlist/changes", url::form_urlencoded::byte_serialize(user.as_bytes()).collect::<String>());
-        self.playlist_changes(&endpoint, Self::changes(op)).await.map(drop)
+        let user = url::form_urlencoded::byte_serialize(user.as_bytes()).collect::<String>();
+        self.playlist_service(&format!("/playlist/v2/user/{user}/rootlist/changes"), &list_changes(op)).await.map(drop)
     }
 
     /// Makes a new, empty playlist at the top of the user's library and
-    /// returns its uri.
+    /// returns its uri: the playlist first, then an entry for it in the
+    /// user's list of playlists (their "rootlist").
     pub async fn create_playlist(&self, name: &str) -> Result<String> {
-        let delta = json!({
-            "ops": [{
-                "kind": "UPDATE_LIST_ATTRIBUTES",
-                "updateListAttributes": {
-                    "newAttributes": { "values": { "name": name, "formatAttributes": [], "pictureSize": [] }, "noValue": [] },
-                },
-            }],
-            "info": { "source": { "client": "WEBPLAYER" } },
-        });
-        let made = self.playlist_changes("/playlist/v2/playlist", delta).await?;
-        let uri = str_of(&made["uri"]);
+        let mut attributes = pl4::ListAttributes::new();
+        attributes.set_name(name.to_owned());
+        let mut request = pl4::ListUpdateRequest::new();
+        request.attributes = MessageField::some(attributes);
+        let reply = self.playlist_service("/playlist/v2/playlist", &request).await?;
+        let made = pl4::CreateListReply::parse_from_bytes(&reply).map_err(|e| e.to_string())?;
+        let uri = made.uri().to_owned();
+        log::debug!("created {uri}");
         if !uri.starts_with("spotify:playlist:") {
             return Err("Spotify didn't make the playlist".into());
         }
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .to_string();
-        self.rootlist_changes(json!({
-            "kind": "ADD",
-            "add": {
-                "addFirst": true,
-                "items": [{ "uri": uri, "attributes": { "timestamp": timestamp, "formatAttributes": [], "availableSignals": [] } }],
-            },
-        }))
-        .await?;
+        // The service makes it without a name whatever the request says;
+        // naming it is a change like Edit Details.
+        self.edit_playlist(&uri, name, "").await?;
+        let mut item = pl4::Item::new();
+        item.set_uri(uri.clone());
+        let mut item_attributes = pl4::ItemAttributes::new();
+        item_attributes.set_timestamp(now_ms());
+        item.attributes = MessageField::some(item_attributes);
+        let mut add = pl4::Add::new();
+        add.set_add_first(true);
+        add.items.push(item);
+        let mut op = pl4::Op::new();
+        op.set_kind(pl4::op::Kind::ADD);
+        op.add = MessageField::some(add);
+        self.rootlist_changes(op).await?;
         Ok(uri)
     }
 
     /// Renames a playlist and sets its description (empty clears it).
     pub async fn edit_playlist(&self, playlist: &str, name: &str, description: &str) -> Result<()> {
-        let mut values = json!({ "name": name, "formatAttributes": [], "pictureSize": [] });
-        let mut no_value = Vec::new();
-        if description.trim().is_empty() {
-            no_value.push("LIST_DESCRIPTION");
-        } else {
-            values["description"] = json!(description.trim());
+        let mut attributes = pl4::ListAttributes::new();
+        attributes.set_name(name.to_owned());
+        let mut cleared = Vec::new();
+        match description.trim() {
+            "" => cleared.push(pl4::ListAttributeKind::LIST_DESCRIPTION),
+            text => attributes.set_description(text.to_owned()),
         }
-        let op = json!({
-            "kind": "UPDATE_LIST_ATTRIBUTES",
-            "updateListAttributes": { "newAttributes": { "values": values, "noValue": no_value } },
-        });
+        let changes = list_changes(list_attributes_op(attributes, cleared));
         let endpoint = format!("/playlist/v2/playlist/{}/changes", id_of(playlist));
-        self.playlist_changes(&endpoint, Self::changes(op)).await.map(drop)
+        self.playlist_service(&endpoint, &changes).await.map(drop)
     }
 
     /// Takes a playlist out of the user's library; for their own playlists
     /// that's Spotify's "Delete".
     pub async fn delete_playlist(&self, playlist: &str) -> Result<()> {
-        self.rootlist_changes(json!({ "kind": "REM", "rem": { "itemsAsKey": true, "items": [{ "uri": playlist }] } }))
-            .await
+        let mut item = pl4::Item::new();
+        item.set_uri(playlist.to_owned());
+        let mut rem = pl4::Rem::new();
+        rem.set_items_as_key(true);
+        rem.items.push(item);
+        let mut op = pl4::Op::new();
+        op.set_kind(pl4::op::Kind::REM);
+        op.rem = MessageField::some(rem);
+        self.rootlist_changes(op).await
     }
 
     /// Sends a Spotify Connect command to another of the account's devices:
@@ -1101,6 +1142,33 @@ fn first_error(v: &Value) -> String {
         .as_str()
         .unwrap_or("Spotify returned no data")
         .to_owned()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// A playlist4 op setting a playlist's name, description... (`cleared`
+/// are the attributes to remove).
+fn list_attributes_op(values: pl4::ListAttributes, cleared: Vec<pl4::ListAttributeKind>) -> pl4::Op {
+    let mut state = pl4::ListAttributesPartialState::new();
+    state.values = MessageField::some(values);
+    state.no_value = cleared.into_iter().map(Into::into).collect();
+    let mut update = pl4::UpdateListAttributes::new();
+    update.new_attributes = MessageField::some(state);
+    let mut op = pl4::Op::new();
+    op.set_kind(pl4::op::Kind::UPDATE_LIST_ATTRIBUTES);
+    op.update_list_attributes = MessageField::some(update);
+    op
+}
+
+/// One op as a change to a playlist (or rootlist), as Spotify's apps send.
+fn list_changes(op: pl4::Op) -> pl4::ListChanges {
+    let mut delta = pl4::Delta::new();
+    delta.ops.push(op);
+    let mut changes = pl4::ListChanges::new();
+    changes.deltas.push(delta);
+    changes
 }
 
 fn str_of(v: &Value) -> String {

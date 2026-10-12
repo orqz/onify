@@ -70,7 +70,7 @@ mod imp {
             snapshot.append_color(&gdk::RGBA::new(0.16, 0.16, 0.16, 1.0), &label_rect);
             if let Some(texture) = self.texture.borrow().as_ref() {
                 snapshot.push_opacity(self.opacity.get());
-                snapshot.append_scaled_texture(texture, gsk::ScalingFilter::Linear, &label_rect);
+                snapshot.append_texture(texture, &label_rect);
                 snapshot.pop();
             }
             snapshot.pop();
@@ -135,7 +135,7 @@ mod imp {
             }
             if let Some(texture) = self.texture.borrow().as_ref() {
                 snapshot.push_opacity(opacity);
-                snapshot.append_scaled_texture(texture, gsk::ScalingFilter::Linear, &bounds);
+                snapshot.append_texture(texture, &bounds);
                 snapshot.pop();
             }
             snapshot.pop();
@@ -194,7 +194,9 @@ impl Cover {
     }
 
     /// Turns the record while music plays, at 10 rpm, unless animations are
-    /// off. Each frame redraws only this small disc.
+    /// off. Redrawn 24 times a second, not every frame: at 10 rpm that looks
+    /// the same, and where GTK can't redraw just the disc (Windows, X11) each
+    /// redraw is the whole window, 144 times a second on a 144 Hz screen.
     pub fn set_spinning(&self, on: bool) {
         let imp = self.imp();
         let animations = gtk::Settings::default().is_none_or(|s| s.is_gtk_enable_animations());
@@ -208,14 +210,20 @@ impl Cover {
             }
             return;
         }
+        const STEP_US: i64 = 1_000_000 / 24;
         let last = Cell::new(None::<i64>);
         let id = self.add_tick_callback(move |cover, clock| {
             let now = clock.frame_time();
-            if let Some(before) = last.replace(Some(now)) {
-                let degrees = (now - before) as f64 / 1_000_000.0 * 60.0;
-                let imp = cover.imp();
-                imp.angle.set((imp.angle.get() + degrees) % 360.0);
-                cover.queue_draw();
+            match last.get() {
+                None => last.set(Some(now)),
+                Some(before) if now - before >= STEP_US => {
+                    last.set(Some(now));
+                    let degrees = (now - before) as f64 / 1_000_000.0 * 60.0;
+                    let imp = cover.imp();
+                    imp.angle.set((imp.angle.get() + degrees) % 360.0);
+                    cover.queue_draw();
+                }
+                Some(_) => {}
             }
             glib::ControlFlow::Continue
         });

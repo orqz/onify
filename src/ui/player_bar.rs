@@ -573,6 +573,12 @@ impl PlayerBar {
         self.state.borrow().playing
     }
 
+    /// Whether a song is loaded in the player (not just last time's song
+    /// shown, or nothing).
+    pub fn has_track(&self) -> bool {
+        self.state.borrow().has_track
+    }
+
     pub fn set_track(&self, now: &NowPlaying) {
         if self.state.borrow().track_uri != now.uri {
             if let Some(fade) = self.text_fade.take() {

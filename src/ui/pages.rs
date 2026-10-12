@@ -1044,9 +1044,14 @@ fn icon_tile(icon: &str, class: &str) -> gtk::Widget {
 
 pub fn tracks_page(kind: Kind, uri: &str, title: &str, images: &Images) -> adw::NavigationPage {
     let loaded = load_tracks(kind, uri);
-    let context = match kind {
-        Kind::Liked => ctx().collection_uri(),
-        _ => uri.to_owned(),
+    // Asked when playing: Liked Songs' context needs the username, which
+    // isn't known until onify has connected.
+    let context = {
+        let uri = uri.to_owned();
+        move || match kind {
+            Kind::Liked => ctx().collection_uri(),
+            _ => uri.clone(),
+        }
     };
 
     let mut record = None;
@@ -1173,12 +1178,12 @@ pub fn tracks_page(kind: Kind, uri: &str, title: &str, images: &Images) -> adw::
             let index = uris.iter().position(|u| *u == track.uri);
             ctx().with_engine(|e| e.play_list(uris, index, None));
         } else {
-            ctx().with_engine(|e| e.play_context(&ctx_uri, Some(&track.uri), None));
+            ctx().with_engine(|e| e.play_context(&ctx_uri(), Some(&track.uri), None));
         }
     });
 
     let store = loaded.store.clone();
-    play.connect_clicked(move |_| play_all(kind, &context, &store));
+    play.connect_clicked(move |_| play_all(kind, &context(), &store));
     shuffle.connect_clicked(|_| ctx().bar.toggle_shuffle());
 
     let scroller = scrolled(&list);
@@ -1410,8 +1415,18 @@ pub fn artist_page(card: &Card) -> adw::NavigationPage {
     let (body_weak, avatar_weak) = (body.downgrade(), avatar.downgrade());
     let (title, subtitle) = (hero.title.clone(), hero.subtitle.clone());
     let (top_weak, popular_weak, latest_weak) = (top.downgrade(), popular.downgrade(), latest.downgrade());
-    if let Some(api) = ctx().api() {
+    {
         glib::spawn_future_local(async move {
+            // Opened before onify has connected (a link at startup): wait.
+            let api = loop {
+                if let Some(api) = ctx().api() {
+                    break api;
+                }
+                if body_weak.upgrade().is_none() {
+                    return;
+                }
+                glib::timeout_future(std::time::Duration::from_millis(200)).await;
+            };
             let artist = rt::spawn(async move { api.artist(&id).await }).await;
             let (Some(body), Some(avatar)) = (body_weak.upgrade(), avatar_weak.upgrade()) else { return };
             let (Some(top), Some(popular), Some(latest)) = (top_weak.upgrade(), popular_weak.upgrade(), latest_weak.upgrade())

@@ -19,6 +19,14 @@ thread_local! {
     static LIBRARY: RefCell<Vec<Card>> = const { RefCell::new(Vec::new()) };
 }
 
+/// The sidebar and Home again after a playlist changed: now, and a moment
+/// later, since Spotify's library can lag a second behind the change itself
+/// (a new playlist went missing from it).
+fn reload_library() {
+    super::load_library();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(2500), super::load_library);
+}
+
 /// The library (re)loaded.
 pub fn library_loaded(library: &[Card]) {
     LIBRARY.with_borrow_mut(|l| *l = library.to_vec());
@@ -141,7 +149,7 @@ pub fn new_playlist(target: &str) {
         .await;
         match made {
             Ok(uri) => {
-                super::load_library();
+                reload_library();
                 let card = Card {
                     kind: Kind::Playlist,
                     uri: uri.clone(),
@@ -220,14 +228,15 @@ pub fn edit_details(playlist: &str, name: &str, description: &str) {
             match rt::spawn(async move { api.edit_playlist(&asked, &name, &description).await }).await {
                 Ok(()) => {
                     super::pages::refresh_list(&playlist);
-                    super::load_library();
+                    reload_library();
                 }
                 Err(e) => toast(&format!("Couldn't save the details: {e}")),
             }
         });
     });
+    // The name has the focus once the dialog is up.
+    dialog.set_focus(Some(&name_entry));
     dialog.present(Some(&ctx().window));
-    name_entry.grab_focus();
 }
 
 /// Takes a playlist out of the library: the user's own are deleted.
@@ -255,7 +264,7 @@ pub fn delete(playlist: &str, name: &str, own: bool) {
                     LIBRARY.with_borrow_mut(|l| l.retain(|c| c.uri != playlist));
                     ctx().stores.borrow_mut().remove(&playlist);
                     super::left_page(&playlist);
-                    super::load_library();
+                    reload_library();
                 }
                 Err(e) => toast(&format!("Couldn't do that: {e}")),
             }
